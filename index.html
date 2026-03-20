@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Naview — Navigate your work, view your growth</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236366f1'/><text x='6' y='24' font-size='20' fill='white'>N</text></svg>">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+  * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+  body { background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); min-height: 100vh; margin: 0; }
+  .fade-in { animation: fadeIn .35s ease; }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(8px) } to { opacity:1; transform:translateY(0) } }
+  @keyframes countUp { from { opacity:0 } to { opacity:1 } }
+  .ring-anim circle:nth-child(2) { transition: stroke-dashoffset .8s cubic-bezier(.4,0,.2,1); }
+  .line-clamp-1 { display:-webkit-box; -webkit-line-clamp:1; -webkit-box-orient:vertical; overflow:hidden; }
+  .line-clamp-2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .card-hover { transition: all .2s ease; }
+  .card-hover:hover { box-shadow: 0 4px 20px rgba(0,0,0,.06); transform: translateY(-1px); }
+  [data-expanded="false"] .card-detail { display:none; }
+  [data-expanded="true"] .card-chevron { transform: rotate(180deg); }
+  .modal-overlay { background: rgba(0,0,0,.3); backdrop-filter: blur(4px); }
+  .progress-bar { transition: width .7s cubic-bezier(.4,0,.2,1); }
+  input:focus, textarea:focus, select:focus { outline:none; box-shadow: 0 0 0 2px rgba(99,102,241,.3); border-color: #6366f1; }
+  .btn-primary { background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); }
+  .btn-primary:hover { filter: brightness(1.05); }
+  .toast { animation: toastIn .3s ease; }
+  @keyframes toastIn { from { opacity:0; transform:translateY(20px) } to { opacity:1; transform:translateY(0) } }
+  /* Scrollbar */
+  ::-webkit-scrollbar { width:6px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb { background:#d1d5db; border-radius:3px; }
+</style>
+</head>
+<body>
+<!-- ═══ APP ROOT ═══ -->
+<div id="app"></div>
+
+<!-- ═══ TOAST CONTAINER ═══ -->
+<div id="toast-container" class="fixed bottom-6 right-6 z-50 flex flex-col gap-2"></div>
+
+<script>
+// ─── Config ───
+const SUPABASE_URL = 'https://agghtubnhctbhtvrmphg.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFnZ2h0dWJuaGN0Ymh0dnJtcGhnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM0MjU5MDcsImV4cCI6MjA4OTAwMTkwN30.LZE7Gioevozs3glxXHAuClXA6aXrIEJLKxISAgJOHG0';
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ─── State ───
+let state = {
+  user: null,
+  projects: [],
+  milestones: {},   // { projectId: [...] }
+  blockers: {},     // { projectId: [...] }
+  wins: {},         // { projectId: [...] }
+  loading: true,
+  tab: 'overview',  // overview | blockers
+  expandedId: null,
+  editingProject: null, // null or project obj for modal
+  editingBlocker: null,
+  editingMilestone: null,
+};
+
+// ─── Icons (SVG strings) ───
+const icons = {
+  barChart: `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>`,
+  target: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>`,
+  eye: `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`,
+  alertTri: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
+  helpCircle: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
+  check: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
+  zap: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
+  users: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+  layers: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>`,
+  star: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
+  shield: `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
+  activity: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`,
+  chevDown: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
+  chevRight: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>`,
+  arrowRight: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>`,
+  plus: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
+  edit: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`,
+  trash: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`,
+  x: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
+  logout: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>`,
+  msgCircle: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>`,
+};
+
+const healthMap = {
+  good:    { label:'順調',   bg:'bg-emerald-50',  text:'text-emerald-600', dot:'bg-emerald-400' },
+  caution: { label:'要注意', bg:'bg-amber-50',    text:'text-amber-600',   dot:'bg-amber-400' },
+  stalled: { label:'停滞',   bg:'bg-orange-50',   text:'text-orange-600',  dot:'bg-orange-400' },
+};
+const blockerStyles = {
+  ai:     { label:'AI対応可', color:'text-blue-600',    bg:'bg-blue-50',    border:'border-blue-100',   dot:'bg-blue-400', icon:'zap' },
+  human:  { label:'人に聞く', color:'text-violet-600',  bg:'bg-violet-50',  border:'border-violet-100', dot:'bg-violet-400', icon:'users' },
+  solved: { label:'解決済み', color:'text-emerald-500', bg:'bg-emerald-50', border:'border-emerald-100',dot:'bg-emerald-400', icon:'check' },
+};
+const projectColors = ['#3b82f6','#10b981','#8b5cf6','#06b6d4','#f59e0b','#ec4899','#6366f1','#ef4444','#14b8a6','#f97316'];
+
+// ─── Toast ───
+function toast(msg, type='success') {
+  const c = document.getElementById('toast-container');
+  const el = document.createElement('div');
+  const colors = type === 'success' ? 'bg-emerald-500' : type === 'error' ? 'bg-red-500' : 'bg-amber-500';
+  el.className = `toast px-4 py-2.5 rounded-xl text-white text-sm font-medium shadow-lg ${colors}`;
+  el.textContent = msg;
+  c.appendChild(el);
+  setTimeout(() => { el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),300); }, 2500);
+}
+
+// ─── Data Loading ───
+async function loadAllData() {
+  state.loading = true;
+  render();
+  try {
+    const { data: projects, error: pe } = await sb.from('nv_projects').select('*').order('sort_order');
+    if (pe) throw pe;
+    state.projects = projects || [];
+    // Load related data for all projects
+    const ids = state.projects.map(p => p.id);
+    if (ids.length) {
+      const [mRes, bRes, wRes] = await Promise.all([
+        sb.from('nv_milestones').select('*').in('project_id', ids).order('sort_order'),
+        sb.from('nv_blockers').select('*').in('project_id', ids).order('sort_order'),
+        sb.from('nv_wins').select('*').in('project_id', ids).order('created_at', { ascending: false }),
+      ]);
+      // Group by project_id
+      state.milestones = {}; state.blockers = {}; state.wins = {};
+      (mRes.data || []).forEach(m => { (state.milestones[m.project_id] ??= []).push(m); });
+      (bRes.data || []).forEach(b => { (state.blockers[b.project_id] ??= []).push(b); });
+      (wRes.data || []).forEach(w => { (state.wins[w.project_id] ??= []).push(w); });
+    }
+  } catch(e) {
+    console.error(e);
+    toast('データ読み込みエラー', 'error');
+  }
+  state.loading = false;
+  render();
+}
+
+// ─── Helpers ───
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function ring(progress, size=56, color='#3b82f6') {
+  const sw=4.5, r=(size-sw*2)/2, c=2*Math.PI*r, off=c-(progress/100)*c;
+  return `<div class="relative" style="width:${size}px;height:${size}px">
+    <svg width="${size}" height="${size}" style="transform:rotate(-90deg)" class="ring-anim">
+      <circle cx="${size/2}" cy="${size/2}" r="${r}" fill="none" stroke="#f1f5f9" stroke-width="${sw}"/>
+      <circle cx="${size/2}" cy="${size/2}" r="${r}" fill="none" stroke="${color}" stroke-width="${sw}"
+        stroke-dasharray="${c}" stroke-dashoffset="${off}" stroke-linecap="round"/>
+    </svg>
+    <div class="absolute inset-0 flex items-center justify-center">
+      <span class="text-xs font-bold text-gray-700">${progress}%</span>
+    </div>
+  </div>`;
+}
+
+// ─── Render: Auth Screen ───
+function renderAuth() {
+  return `
+  <div class="min-h-screen flex items-center justify-center p-4" style="background:linear-gradient(180deg,#f8fafc 0%,#f1f5f9 100%)">
+    <div class="w-full max-w-sm fade-in">
+      <div class="text-center mb-8">
+        <div class="w-16 h-16 rounded-2xl flex items-center justify-center shadow-lg mx-auto mb-4"
+          style="background:linear-gradient(135deg,#6366f1 0%,#8b5cf6 50%,#a78bfa 100%)">
+          <span class="text-white">${icons.barChart}</span>
+        </div>
+        <h1 class="text-2xl font-extrabold text-gray-800">Naview</h1>
+        <p class="text-sm text-gray-400 mt-1">Navigate your work, view your growth</p>
+      </div>
+      <div class="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+        <div class="flex gap-1 p-1 bg-gray-50 rounded-xl mb-5">
+          <button onclick="switchAuthTab('login')" id="auth-tab-login"
+            class="flex-1 py-2 rounded-lg text-xs font-semibold transition-all bg-white text-gray-800 shadow-sm">ログイン</button>
+          <button onclick="switchAuthTab('signup')" id="auth-tab-signup"
+            class="flex-1 py-2 rounded-lg text-xs font-semibold transition-all text-gray-400">新規登録</button>
+        </div>
+        <div id="auth-error" class="hidden text-xs text-red-500 bg-red-50 rounded-lg p-2.5 mb-4"></div>
+        <input id="auth-email" type="email" placeholder="メールアドレス"
+          class="w-full px-4 py-3 rounded-xl border border-gray-200 text-sm mb-3 bg-gray-50/50">
+        <input id="auth-pass" type="password" placeholder="パスワード"
+          class="w-full px-4 py-3 rounded-xl border border-gray-200 text-sm mb-4 bg-gray-50/50">
+        <button onclick="doAuth()" id="auth-btn"
+          class="w-full btn-primary text-white font-bold py-3 rounded-xl text-sm transition-all">ログイン</button>
+      </div>
+    </div>
+  </div>`;
+}
+let authTab = 'login';
+window.switchAuthTab = function(t) {
+  authTab = t;
+  document.getElementById('auth-tab-login').className = `flex-1 py-2 rounded-lg text-xs font-semibold transition-all ${t==='login'?'bg-white text-gray-800 shadow-sm':'text-gray-400'}`;
+  document.getElementById('auth-tab-signup').className = `flex-1 py-2 rounded-lg text-xs font-semibold transition-all ${t==='signup'?'bg-white text-gray-800 shadow-sm':'text-gray-400'}`;
+  document.getElementById('auth-btn').textContent = t==='login'?'ログイン':'新規登録';
+};
+window.doAuth = async function() {
+  const email = document.getElementById('auth-email').value.trim();
+  const pass = document.getElementById('auth-pass').value;
+  const errEl = document.getElementById('auth-error');
+  if(!email||!pass){ errEl.textContent='入力してください'; errEl.classList.remove('hidden'); return; }
+  errEl.classList.add('hidden');
+  const btn = document.getElementById('auth-btn');
+  btn.disabled=true; btn.textContent='...';
+  let res;
+  if(authTab==='login') res = await sb.auth.signInWithPassword({email,password:pass});
+  else res = await sb.auth.signUp({email,password:pass});
+  if(res.error){ errEl.textContent=res.error.message; errEl.classList.remove('hidden'); btn.disabled=false; btn.textContent=authTab==='login'?'ログイン':'新規登録'; return; }
+  state.user = res.data.user;
+  await loadAllData();
+};
+
+// ─── Render: Loading ───
+function renderLoading() {
+  return `<div class="min-h-screen flex items-center justify-center">
+    <div class="text-center fade-in">
+      <div class="w-12 h-12 rounded-2xl flex items-center justify-center mx-auto mb-3 animate-pulse"
+        style="background:linear-gradient(135deg,#6366f1,#8b5cf6)">
+        <span class="text-white">${icons.barChart}</span>
+      </div>
+      <p class="text-sm text-gray-400">読み込み中...</p>
+    </div>
+  </div>`;
+}
+
+// ─── Render: Main Dashboard ───
+function renderDashboard() {
+  const ps = state.projects;
+  const active = ps.filter(p => p.progress < 100);
+  const avgProgress = active.length ? Math.round(active.reduce((s,p)=>s+p.progress,0)/active.length) : 0;
+
+  const allBlockers = [];
+  const humanItems = [];
+  const aiItems = [];
+  ps.forEach(p => {
+    (state.blockers[p.id]||[]).forEach(b => {
+      const item = { project: p.name, projectColor: p.color, ...b };
+      allBlockers.push(item);
+      if(b.type==='human') humanItems.push(item);
+      if(b.type==='ai') aiItems.push(item);
+    });
+  });
+  const totalBlockers = humanItems.length + aiItems.length;
+
+  return `
+  <div class="max-w-5xl mx-auto px-4 sm:px-6 py-8 fade-in">
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-8">
+      <div class="flex items-center gap-3">
+        <div class="w-11 h-11 rounded-2xl flex items-center justify-center shadow-lg"
+          style="background:linear-gradient(135deg,#6366f1 0%,#8b5cf6 50%,#a78bfa 100%)">
+          <span class="text-white">${icons.barChart}</span>
+        </div>
+        <div>
+          <h1 class="text-xl font-extrabold text-gray-800 tracking-tight">Naview</h1>
+          <p class="text-[11px] text-gray-400 font-medium tracking-wide">Navigate your work, view your growth</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <div class="flex gap-1 p-1 bg-white rounded-xl border border-gray-100 shadow-sm">
+          <button onclick="setTab('overview')"
+            class="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all ${state.tab==='overview'?'bg-gray-800 text-white shadow-sm':'text-gray-400 hover:text-gray-600'}">
+            <span class="${state.tab==='overview'?'text-white':'text-gray-400'}">${icons.activity}</span> 概要
+          </button>
+          <button onclick="setTab('blockers')"
+            class="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all ${state.tab==='blockers'?'bg-gray-800 text-white shadow-sm':'text-gray-400 hover:text-gray-600'}">
+            <span class="${state.tab==='blockers'?'text-white':'text-gray-400'}">${icons.alertTri}</span> 課題
+            ${totalBlockers>0?`<span class="w-5 h-5 rounded-full text-[10px] flex items-center justify-center font-bold ${state.tab==='blockers'?'bg-white/20 text-white':'bg-amber-100 text-amber-600'}">${totalBlockers}</span>`:''}
+          </button>
+        </div>
+        <button onclick="doLogout()" class="w-8 h-8 rounded-lg flex items-center justify-center text-gray-300 hover:text-gray-500 hover:bg-gray-100 transition-all" title="ログアウト">
+          ${icons.logout}
+        </button>
+      </div>
+    </div>
+
+    <!-- 4 Pillars -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+      ${renderPillar(icons.target, '期待値定義', ps.filter(p=>p.done_image).length+'/'+ps.length, '#6366f1', 'ゴール言語化済み')}
+      ${renderPillar(icons.eye, '進捗可視化', avgProgress+'%', '#10b981', '全体平均')}
+      ${renderPillar(icons.alertTri, '課題把握', totalBlockers+'件', '#f59e0b', '未解決ブロッカー')}
+      ${renderPillar(icons.helpCircle, '助けを求める', humanItems.length+'件', '#8b5cf6', '人に聞くべき')}
+    </div>
+
+    ${state.tab==='overview' ? renderOverviewTab(active, humanItems, aiItems) : renderBlockersTab(humanItems, aiItems)}
+
+    <!-- Footer -->
+    <div class="mt-12 text-center pb-6">
+      <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white border border-gray-100 shadow-sm">
+        <div class="w-1.5 h-1.5 rounded-full bg-indigo-400"></div>
+        <span class="text-[11px] text-gray-400 font-medium">Naview — 期待値定義 × 進捗可視化 × 課題把握 × 助けを求める</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderPillar(icon, title, stat, color, desc) {
+  return `<div class="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm card-hover group">
+    <div class="w-10 h-10 rounded-xl flex items-center justify-center mb-3 transition-transform group-hover:scale-105"
+      style="background:${color}10">
+      <span style="color:${color}">${icon}</span>
+    </div>
+    <div class="text-2xl font-extrabold text-gray-800 tabular-nums mb-0.5">${esc(stat)}</div>
+    <p class="text-xs font-bold text-gray-500 uppercase tracking-wider">${esc(title)}</p>
+    <p class="text-[11px] text-gray-400 mt-0.5">${esc(desc)}</p>
+  </div>`;
+}
+
+// ─── Overview Tab ───
+function renderOverviewTab(active, humanItems, aiItems) {
+  const sorted = [...active].sort((a,b) => b.progress-a.progress);
+  const sortedCards = [...active].sort((a,b) => {
+    const order = {stalled:0, caution:1, good:2};
+    return (order[a.health]??3)-(order[b.health]??3);
+  });
+
+  return `
+    <!-- Add Project Button -->
+    <div class="mb-4 flex justify-end">
+      <button onclick="openProjectModal()" class="flex items-center gap-1.5 px-4 py-2 rounded-xl btn-primary text-white text-xs font-semibold shadow-sm hover:shadow transition-all">
+        ${icons.plus} プロジェクト追加
+      </button>
+    </div>
+
+    <!-- Overview Bar -->
+    <div class="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm mb-4">
+      <div class="flex items-center justify-between mb-4">
+        <span class="text-xs font-bold text-gray-400 uppercase tracking-wider">全プロジェクト進捗</span>
+        <span class="text-xs text-gray-300">${active.length}件</span>
+      </div>
+      <div class="space-y-2.5">
+        ${sorted.map(p => {
+          const h = healthMap[p.health]||healthMap.caution;
+          return `<div class="flex items-center gap-3 group">
+            <span class="text-xs text-gray-500 w-28 truncate font-medium">${esc(p.name)}</span>
+            <div class="flex-1 h-2.5 bg-gray-100 rounded-full overflow-hidden">
+              <div class="h-full rounded-full progress-bar" style="width:${p.progress}%;background:${p.color}"></div>
+            </div>
+            <span class="text-xs text-gray-400 tabular-nums w-10 text-right font-semibold">${p.progress}%</span>
+            <span class="w-1.5 h-1.5 rounded-full ${h.dot}"></span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+
+    <!-- Action Alerts -->
+    ${renderAlert(icons.users, '人に聞いた方がいい', '#8b5cf6', 'bg-violet-50/50', 'border-violet-100', humanItems)}
+    ${renderAlert(icons.zap, 'AIが今すぐ対応できる', '#3b82f6', 'bg-blue-50/50', 'border-blue-100', aiItems)}
+
+    <!-- Project Cards -->
+    <div class="pt-2 space-y-3">
+      ${sortedCards.map(p => renderCard(p)).join('')}
+    </div>`;
+}
+
+function renderAlert(icon, title, color, bg, border, items) {
+  if(!items.length) return '';
+  return `<div class="rounded-2xl border ${border} ${bg} overflow-hidden mb-4">
+    <div class="px-5 py-3 flex items-center gap-2.5 border-b" style="border-color:${color}15">
+      <div class="w-7 h-7 rounded-lg flex items-center justify-center" style="background:${color}15">
+        <span style="color:${color}">${icon}</span>
+      </div>
+      <h3 class="text-sm font-bold" style="color:${color}">${esc(title)}</h3>
+      <span class="ml-auto text-[11px] font-bold px-2 py-0.5 rounded-full" style="background:${color}15;color:${color}">${items.length}件</span>
+    </div>
+    <div class="px-5 py-3 space-y-2">
+      ${items.map(it => `<div class="flex items-start gap-2.5 group">
+        <span class="mt-0.5 shrink-0 opacity-40 group-hover:opacity-100 transition-opacity" style="color:${color}">${icons.arrowRight}</span>
+        <span class="text-sm text-gray-600">
+          <span class="font-bold" style="color:${color}">${esc(it.project)}</span>
+          <span class="text-gray-300 mx-1.5">—</span>${esc(it.text)}
+        </span>
+      </div>`).join('')}
+    </div>
+  </div>`;
+}
+
+function renderCard(p) {
+  const h = healthMap[p.health]||healthMap.caution;
+  const ms = state.milestones[p.id]||[];
+  const bs = state.blockers[p.id]||[];
+  const ws = state.wins[p.id]||[];
+  const human = bs.filter(b=>b.type==='human');
+  const ai = bs.filter(b=>b.type==='ai');
+  const expanded = state.expandedId === p.id;
+
+  return `<div class="bg-white rounded-2xl border border-gray-100 overflow-hidden transition-all duration-300 shadow-sm card-hover" data-expanded="${expanded}">
+    <div class="h-1 w-full" style="background:${p.color}"></div>
+    <div class="p-5 cursor-pointer" onclick="toggleExpand('${p.id}')">
+      <div class="flex items-start gap-4">
+        ${ring(p.progress, 56, p.color)}
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap mb-1">
+            <h3 class="text-[15px] font-bold text-gray-800">${esc(p.name)}</h3>
+            <span class="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${h.bg} ${h.text}">
+              <span class="w-1.5 h-1.5 rounded-full ${h.dot}"></span>${h.label}
+            </span>
+            <span class="text-[11px] text-gray-400">${esc(p.phase||'')}</span>
+          </div>
+          <p class="text-sm text-gray-500 leading-relaxed line-clamp-1">${esc(p.goal||'')}</p>
+          <div class="flex items-center gap-4 mt-2">
+            ${human.length?`<span class="flex items-center gap-1 text-[11px] text-violet-500 font-medium">${icons.helpCircle} ${human.length}件 要相談</span>`:''}
+            ${ai.length?`<span class="flex items-center gap-1 text-[11px] text-blue-500 font-medium">${icons.zap} ${ai.length}件 AI可</span>`:''}
+            <span class="flex items-center gap-1 text-[11px] text-emerald-500 font-medium">${icons.check} ${ws.length}件 達成</span>
+            <span class="text-[11px] text-gray-300 ml-auto">${esc(p.owner||'')}</span>
+          </div>
+        </div>
+        <div class="w-7 h-7 rounded-lg flex items-center justify-center bg-gray-50 transition-transform duration-300 card-chevron text-gray-400">
+          ${icons.chevDown}
+        </div>
+      </div>
+    </div>
+    <div class="card-detail">
+      <div class="px-5 pb-5 space-y-5">
+        <div class="h-px bg-gray-100"></div>
+        <!-- Edit/Delete -->
+        <div class="flex gap-2">
+          <button onclick="openProjectModal('${p.id}')" class="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium text-gray-500 bg-gray-50 hover:bg-gray-100 transition-all">
+            ${icons.edit} 編集
+          </button>
+          <button onclick="deleteProject('${p.id}')" class="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium text-red-400 bg-red-50 hover:bg-red-100 transition-all">
+            ${icons.trash} 削除
+          </button>
+        </div>
+        <!-- Goal -->
+        ${p.done_image ? `<div class="rounded-xl p-4 border border-gray-100 bg-gray-50/50">
+          <div class="flex items-center gap-2 mb-2">
+            <span class="text-indigo-400">${icons.target}</span>
+            <span class="text-[10px] font-bold text-indigo-500 uppercase tracking-wider">ゴール（完成イメージ）</span>
+          </div>
+          <p class="text-sm text-gray-600 leading-relaxed">${esc(p.done_image)}</p>
+        </div>` : ''}
+        <!-- Two columns -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <!-- Milestones -->
+          <div class="rounded-xl p-4 bg-gray-50/50 border border-gray-100">
+            <div class="flex items-center justify-between mb-3">
+              <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+                ${icons.layers} マイルストーン
+              </span>
+              <div class="flex items-center gap-2">
+                <span class="text-xs text-gray-400 tabular-nums">${ms.filter(m=>m.done).length}/${ms.length}</span>
+                <button onclick="openMilestoneModal('${p.id}')" class="text-gray-300 hover:text-indigo-500 transition-all" title="追加">
+                  ${icons.plus}
+                </button>
+              </div>
+            </div>
+            <div class="space-y-0">
+              ${ms.map((m,i) => `<div class="flex items-start gap-3 group">
+                <div class="flex flex-col items-center">
+                  <button onclick="toggleMilestone('${m.id}',${!m.done})" class="w-5 h-5 rounded-full flex items-center justify-center border-2 transition-all cursor-pointer
+                    ${m.done?'bg-emerald-500 border-emerald-500 hover:bg-emerald-600':'bg-white border-gray-200 hover:border-indigo-300'}">
+                    ${m.done?`<span class="text-white">${icons.check}</span>`:''}
+                  </button>
+                  ${i<ms.length-1?`<div class="w-0.5 h-5 ${m.done?'bg-emerald-200':'bg-gray-100'}"></div>`:''}
+                </div>
+                <div class="flex items-center gap-2 pt-0.5 flex-1 min-w-0">
+                  <span class="text-sm ${m.done?'text-gray-600':'text-gray-400'} truncate">${esc(m.label)}</span>
+                  <button onclick="deleteMilestone('${m.id}','${p.id}')" class="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 transition-all shrink-0">
+                    ${icons.trash}
+                  </button>
+                </div>
+              </div>`).join('')}
+            </div>
+          </div>
+          <!-- Blockers -->
+          <div class="space-y-2.5">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+                ${icons.alertTri} 課題
+              </span>
+              <button onclick="openBlockerModal('${p.id}')" class="text-gray-300 hover:text-indigo-500 transition-all" title="追加">
+                ${icons.plus}
+              </button>
+            </div>
+            ${bs.length ? bs.map(b => renderBlocker(b, p.id)).join('') : `
+            <div class="h-full flex items-center justify-center rounded-xl border border-dashed border-emerald-200 bg-emerald-50/50 p-6">
+              <div class="text-center">
+                <span class="text-emerald-300">${icons.shield}</span>
+                <p class="text-xs text-emerald-400 font-medium mt-1">課題なし</p>
+              </div>
+            </div>`}
+          </div>
+        </div>
+        <!-- Wins -->
+        <div>
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+              ${icons.star} 最近の成果
+            </span>
+            <button onclick="addWin('${p.id}')" class="text-gray-300 hover:text-indigo-500 transition-all" title="追加">
+              ${icons.plus}
+            </button>
+          </div>
+          <div class="flex flex-wrap gap-1.5">
+            ${ws.map(w => `<span class="text-[11px] px-3 py-1.5 rounded-full bg-emerald-50 text-emerald-600 border border-emerald-100 font-medium group inline-flex items-center gap-1">
+              ${esc(w.text)}
+              <button onclick="deleteWin('${w.id}','${p.id}')" class="opacity-0 group-hover:opacity-100 text-emerald-300 hover:text-red-400 transition-all">&times;</button>
+            </span>`).join('')}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderBlocker(b, pid) {
+  const c = blockerStyles[b.type] || blockerStyles.ai;
+  return `<div class="rounded-xl ${c.bg} border ${c.border} overflow-hidden transition-all">
+    <div class="px-3.5 py-2.5 flex items-start gap-2.5">
+      <span class="${c.color} mt-0.5 shrink-0">${icons[c.icon]}</span>
+      <div class="flex-1 min-w-0">
+        <span class="text-[10px] font-bold uppercase tracking-wider ${c.color}">${c.label}</span>
+        <p class="text-sm text-gray-600 mt-0.5 leading-relaxed">${esc(b.text)}</p>
+        ${b.detail?`<p class="text-xs text-gray-400 mt-1"><span class="font-semibold text-gray-500">Next →</span> ${esc(b.detail)}</p>`:''}
+      </div>
+      <div class="flex items-center gap-1 shrink-0">
+        <button onclick="cycleBlockerType('${b.id}','${b.type}','${pid}')" class="text-gray-300 hover:text-gray-500 transition-all" title="タイプ変更">
+          ${icons.edit}
+        </button>
+        <button onclick="deleteBlocker('${b.id}','${pid}')" class="text-gray-300 hover:text-red-400 transition-all" title="削除">
+          ${icons.trash}
+        </button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ─── Blockers Tab ───
+function renderBlockersTab(humanItems, aiItems) {
+  const solvedItems = [];
+  state.projects.forEach(p => {
+    (state.blockers[p.id]||[]).filter(b=>b.type==='solved').forEach(b => {
+      solvedItems.push({ project: p.name, projectColor: p.color, ...b });
+    });
+  });
+
+  return `
+    <!-- Human -->
+    <div class="mb-6">
+      <div class="flex items-center gap-2 mb-3">
+        <div class="w-8 h-8 rounded-xl bg-violet-50 flex items-center justify-center"><span class="text-violet-500">${icons.users}</span></div>
+        <h2 class="text-sm font-bold text-gray-700">人に聞くべき課題</h2>
+        <span class="ml-auto text-xs font-bold text-violet-500 bg-violet-50 px-2 py-0.5 rounded-full">${humanItems.length}件</span>
+      </div>
+      ${humanItems.length===0 ? '<div class="text-center py-10 text-gray-300 text-sm bg-white rounded-2xl border border-gray-100">なし</div>' :
+        `<div class="space-y-2">${groupBlockersByProject(humanItems,'violet').join('')}</div>`}
+    </div>
+    <!-- AI -->
+    <div class="mb-6">
+      <div class="flex items-center gap-2 mb-3">
+        <div class="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center"><span class="text-blue-500">${icons.zap}</span></div>
+        <h2 class="text-sm font-bold text-gray-700">AIが対応できる課題</h2>
+        <span class="ml-auto text-xs font-bold text-blue-500 bg-blue-50 px-2 py-0.5 rounded-full">${aiItems.length}件</span>
+      </div>
+      ${aiItems.length===0 ? '<div class="text-center py-10 text-gray-300 text-sm bg-white rounded-2xl border border-gray-100">なし</div>' :
+        `<div class="space-y-2">${groupBlockersByProject(aiItems,'blue').join('')}</div>`}
+    </div>
+    <!-- Solved -->
+    <div>
+      <div class="flex items-center gap-2 mb-3">
+        <div class="w-8 h-8 rounded-xl bg-emerald-50 flex items-center justify-center"><span class="text-emerald-500">${icons.check}</span></div>
+        <h2 class="text-sm font-bold text-gray-700">解決済み</h2>
+      </div>
+      ${solvedItems.length===0 ? '<div class="text-center py-10 text-gray-300 text-sm bg-white rounded-2xl border border-gray-100">なし</div>' :
+        `<div class="space-y-2">${groupBlockersByProject(solvedItems,'emerald',true).join('')}</div>`}
+    </div>`;
+}
+
+function groupBlockersByProject(items, colorName, faded=false) {
+  const groups = {};
+  items.forEach(it => { (groups[it.project]??=[]).push(it); });
+  return Object.entries(groups).map(([name, bs]) => {
+    return `<div class="bg-white rounded-2xl border border-${colorName}-100 p-4 ${faded?'opacity-60':''}">
+      <div class="text-xs font-bold text-${colorName}-500 mb-2 flex items-center gap-2">
+        <div class="w-2 h-2 rounded-full" style="background:${bs[0].projectColor}"></div>${esc(name)}
+      </div>
+      <div class="space-y-2">
+        ${bs.map(b => `<div class="text-sm text-gray-600 flex items-start gap-2">
+          ${faded?`<span class="text-emerald-400 mt-0.5">${icons.check}</span><span class="line-through">${esc(b.text)}</span>`
+                 :`<span class="text-gray-300 mt-0.5">${icons.arrowRight}</span><span>${esc(b.text)}${b.detail?` <span class="text-xs text-gray-400">— ${esc(b.detail)}</span>`:''}</span>`}
+        </div>`).join('')}
+      </div>
+    </div>`;
+  });
+}
+
+// ─── CRUD Actions ───
+window.setTab = function(t) { state.tab = t; render(); };
+window.toggleExpand = function(id) { state.expandedId = state.expandedId===id ? null : id; render(); };
+window.doLogout = async function() { await sb.auth.signOut(); state.user=null; state.projects=[]; render(); };
+
+window.toggleMilestone = async function(id, done) {
+  const { error } = await sb.from('nv_milestones').update({ done }).eq('id', id);
+  if(error) { toast('更新エラー','error'); return; }
+  // Update local & recalc progress
+  for(const pid in state.milestones) {
+    const m = state.milestones[pid].find(m=>m.id===id);
+    if(m) { m.done = done; await recalcProgress(pid); break; }
+  }
+  render();
+};
+
+async function recalcProgress(pid) {
+  const ms = state.milestones[pid]||[];
+  if(!ms.length) return;
+  const progress = Math.round((ms.filter(m=>m.done).length / ms.length) * 100);
+  await sb.from('nv_projects').update({ progress }).eq('id', pid);
+  const p = state.projects.find(p=>p.id===pid);
+  if(p) p.progress = progress;
+}
+
+window.deleteProject = async function(id) {
+  if(!confirm('このプロジェクトを削除しますか？')) return;
+  const { error } = await sb.from('nv_projects').delete().eq('id', id);
+  if(error) { toast('削除エラー','error'); return; }
+  state.projects = state.projects.filter(p=>p.id!==id);
+  delete state.milestones[id]; delete state.blockers[id]; delete state.wins[id];
+  if(state.expandedId===id) state.expandedId=null;
+  toast('削除しました'); render();
+};
+
+window.deleteMilestone = async function(id, pid) {
+  const { error } = await sb.from('nv_milestones').delete().eq('id', id);
+  if(error) { toast('削除エラー','error'); return; }
+  state.milestones[pid] = (state.milestones[pid]||[]).filter(m=>m.id!==id);
+  await recalcProgress(pid);
+  toast('削除しました'); render();
+};
+
+window.deleteBlocker = async function(id, pid) {
+  const { error } = await sb.from('nv_blockers').delete().eq('id', id);
+  if(error) { toast('削除エラー','error'); return; }
+  state.blockers[pid] = (state.blockers[pid]||[]).filter(b=>b.id!==id);
+  toast('削除しました'); render();
+};
+
+window.deleteWin = async function(id, pid) {
+  const { error } = await sb.from('nv_wins').delete().eq('id', id);
+  if(error) { toast('削除エラー','error'); return; }
+  state.wins[pid] = (state.wins[pid]||[]).filter(w=>w.id!==id);
+  toast('削除しました'); render();
+};
+
+window.cycleBlockerType = async function(id, current, pid) {
+  const order = ['ai','human','solved'];
+  const next = order[(order.indexOf(current)+1) % order.length];
+  const { error } = await sb.from('nv_blockers').update({ type: next }).eq('id', id);
+  if(error) { toast('更新エラー','error'); return; }
+  const b = (state.blockers[pid]||[]).find(b=>b.id===id);
+  if(b) b.type = next;
+  toast(`タイプ変更: ${blockerStyles[next].label}`); render();
+};
+
+window.addWin = async function(pid) {
+  const text = prompt('成果を入力:');
+  if(!text?.trim()) return;
+  const { data, error } = await sb.from('nv_wins').insert({ project_id: pid, user_id: state.user.id, text: text.trim() }).select().single();
+  if(error) { toast('追加エラー','error'); return; }
+  (state.wins[pid]??=[]).unshift(data);
+  toast('追加しました'); render();
+};
+
+// ─── Modal: Project ───
+window.openProjectModal = function(id) {
+  const p = id ? state.projects.find(p=>p.id===id) : null;
+  const isNew = !p;
+  const modal = document.createElement('div');
+  modal.id = 'modal-overlay';
+  modal.className = 'fixed inset-0 z-40 modal-overlay flex items-center justify-center p-4';
+  modal.onclick = (e) => { if(e.target===modal) modal.remove(); };
+  modal.innerHTML = `
+  <div class="bg-white rounded-2xl shadow-xl w-full max-w-lg fade-in overflow-hidden" onclick="event.stopPropagation()">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+      <h2 class="text-base font-bold text-gray-800">${isNew?'プロジェクト追加':'プロジェクト編集'}</h2>
+      <button onclick="document.getElementById('modal-overlay').remove()" class="text-gray-300 hover:text-gray-500">${icons.x}</button>
+    </div>
+    <div class="px-6 py-5 space-y-4 max-h-[70vh] overflow-y-auto">
+      <div>
+        <label class="text-xs font-semibold text-gray-500 mb-1 block">名前 *</label>
+        <input id="m-name" value="${esc(p?.name||'')}" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-xs font-semibold text-gray-500 mb-1 block">カラー</label>
+          <div class="flex flex-wrap gap-1.5" id="m-colors">
+            ${projectColors.map(c => `<button onclick="document.getElementById('m-color-val').value='${c}';document.querySelectorAll('#m-colors button').forEach(b=>b.style.outline='none');this.style.outline='2px solid ${c}'"
+              class="w-7 h-7 rounded-full" style="background:${c};${(p?.color||'#3b82f6')===c?`outline:2px solid ${c}`:''}"></button>`).join('')}
+          </div>
+          <input type="hidden" id="m-color-val" value="${p?.color||'#3b82f6'}">
+        </div>
+        <div>
+          <label class="text-xs font-semibold text-gray-500 mb-1 block">ヘルス</label>
+          <select id="m-health" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
+            <option value="good" ${p?.health==='good'?'selected':''}>順調</option>
+            <option value="caution" ${(!p||p?.health==='caution')?'selected':''}>要注意</option>
+            <option value="stalled" ${p?.health==='stalled'?'selected':''}>停滞</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-gray-500 mb-1 block">ゴール</label>
+        <textarea id="m-goal" rows="2" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm resize-none">${esc(p?.goal||'')}</textarea>
+      </div>
+      <div>
+        <label class="text-xs font-semibold text-gray-500 mb-1 block">完成イメージ</label>
+        <textarea id="m-doneimg" rows="2" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm resize-none">${esc(p?.done_image||'')}</textarea>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-xs font-semibold text-gray-500 mb-1 block">フェーズ</label>
+          <input id="m-phase" value="${esc(p?.phase||'')}" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
+        </div>
+        <div>
+          <label class="text-xs font-semibold text-gray-500 mb-1 block">オーナー</label>
+          <input id="m-owner" value="${esc(p?.owner||'')}" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm" placeholder="例: Cowork + 自分">
+        </div>
+      </div>
+      ${!isNew ? `<div>
+        <label class="text-xs font-semibold text-gray-500 mb-1 block">進捗 (${p.progress}%)</label>
+        <input type="range" id="m-progress" min="0" max="100" value="${p.progress}" class="w-full"
+          oninput="document.getElementById('m-prog-label').textContent=this.value+'%'">
+        <span id="m-prog-label" class="text-xs text-gray-400">${p.progress}%</span>
+      </div>` : ''}
+    </div>
+    <div class="px-6 py-4 border-t border-gray-100 flex justify-end gap-2">
+      <button onclick="document.getElementById('modal-overlay').remove()" class="px-4 py-2 rounded-xl text-sm font-medium text-gray-500 hover:bg-gray-50">キャンセル</button>
+      <button onclick="saveProject('${id||''}')" class="px-5 py-2 rounded-xl text-sm font-semibold text-white btn-primary">保存</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+};
+
+window.saveProject = async function(id) {
+  const name = document.getElementById('m-name').value.trim();
+  if(!name) { toast('名前を入力してください','error'); return; }
+  const data = {
+    name,
+    color: document.getElementById('m-color-val').value,
+    health: document.getElementById('m-health').value,
+    goal: document.getElementById('m-goal').value.trim(),
+    done_image: document.getElementById('m-doneimg').value.trim(),
+    phase: document.getElementById('m-phase').value.trim(),
+    owner: document.getElementById('m-owner').value.trim(),
+  };
+  if(id) {
+    // Update
+    const progEl = document.getElementById('m-progress');
+    if(progEl) data.progress = parseInt(progEl.value);
+    const { error } = await sb.from('nv_projects').update(data).eq('id', id);
+    if(error) { toast('更新エラー','error'); return; }
+    const p = state.projects.find(p=>p.id===id);
+    if(p) Object.assign(p, data);
+  } else {
+    // Insert
+    data.user_id = state.user.id;
+    data.progress = 0;
+    data.sort_order = state.projects.length + 1;
+    const { data: newP, error } = await sb.from('nv_projects').insert(data).select().single();
+    if(error) { toast('追加エラー','error'); return; }
+    state.projects.push(newP);
+    state.milestones[newP.id] = [];
+    state.blockers[newP.id] = [];
+    state.wins[newP.id] = [];
+  }
+  document.getElementById('modal-overlay').remove();
+  toast(id?'更新しました':'追加しました'); render();
+};
+
+// ─── Modal: Milestone ───
+window.openMilestoneModal = function(pid) {
+  const modal = document.createElement('div');
+  modal.id = 'modal-overlay';
+  modal.className = 'fixed inset-0 z-40 modal-overlay flex items-center justify-center p-4';
+  modal.onclick = (e) => { if(e.target===modal) modal.remove(); };
+  modal.innerHTML = `
+  <div class="bg-white rounded-2xl shadow-xl w-full max-w-sm fade-in" onclick="event.stopPropagation()">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+      <h2 class="text-base font-bold text-gray-800">マイルストーン追加</h2>
+      <button onclick="document.getElementById('modal-overlay').remove()" class="text-gray-300 hover:text-gray-500">${icons.x}</button>
+    </div>
+    <div class="px-6 py-5 space-y-3">
+      <input id="m-ms-label" placeholder="マイルストーン名" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
+    </div>
+    <div class="px-6 py-4 border-t border-gray-100 flex justify-end gap-2">
+      <button onclick="document.getElementById('modal-overlay').remove()" class="px-4 py-2 rounded-xl text-sm font-medium text-gray-500 hover:bg-gray-50">キャンセル</button>
+      <button onclick="saveMilestone('${pid}')" class="px-5 py-2 rounded-xl text-sm font-semibold text-white btn-primary">追加</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  setTimeout(()=>document.getElementById('m-ms-label').focus(),100);
+};
+
+window.saveMilestone = async function(pid) {
+  const label = document.getElementById('m-ms-label').value.trim();
+  if(!label) { toast('名前を入力してください','error'); return; }
+  const ms = state.milestones[pid]||[];
+  const { data, error } = await sb.from('nv_milestones').insert({
+    project_id: pid, user_id: state.user.id, label, done: false, sort_order: ms.length+1
+  }).select().single();
+  if(error) { toast('追加エラー','error'); return; }
+  (state.milestones[pid]??=[]).push(data);
+  await recalcProgress(pid);
+  document.getElementById('modal-overlay').remove();
+  toast('追加しました'); render();
+};
+
+// ─── Modal: Blocker ───
+window.openBlockerModal = function(pid) {
+  const modal = document.createElement('div');
+  modal.id = 'modal-overlay';
+  modal.className = 'fixed inset-0 z-40 modal-overlay flex items-center justify-center p-4';
+  modal.onclick = (e) => { if(e.target===modal) modal.remove(); };
+  modal.innerHTML = `
+  <div class="bg-white rounded-2xl shadow-xl w-full max-w-sm fade-in" onclick="event.stopPropagation()">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+      <h2 class="text-base font-bold text-gray-800">課題追加</h2>
+      <button onclick="document.getElementById('modal-overlay').remove()" class="text-gray-300 hover:text-gray-500">${icons.x}</button>
+    </div>
+    <div class="px-6 py-5 space-y-3">
+      <input id="m-b-text" placeholder="課題の内容" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
+      <select id="m-b-type" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
+        <option value="ai">AI対応可</option>
+        <option value="human">人に聞く</option>
+        <option value="solved">解決済み</option>
+      </select>
+      <input id="m-b-detail" placeholder="詳細・Next Action (任意)" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
+    </div>
+    <div class="px-6 py-4 border-t border-gray-100 flex justify-end gap-2">
+      <button onclick="document.getElementById('modal-overlay').remove()" class="px-4 py-2 rounded-xl text-sm font-medium text-gray-500 hover:bg-gray-50">キャンセル</button>
+      <button onclick="saveBlocker('${pid}')" class="px-5 py-2 rounded-xl text-sm font-semibold text-white btn-primary">追加</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  setTimeout(()=>document.getElementById('m-b-text').focus(),100);
+};
+
+window.saveBlocker = async function(pid) {
+  const text = document.getElementById('m-b-text').value.trim();
+  if(!text) { toast('内容を入力してください','error'); return; }
+  const bs = state.blockers[pid]||[];
+  const { data, error } = await sb.from('nv_blockers').insert({
+    project_id: pid, user_id: state.user.id, text,
+    type: document.getElementById('m-b-type').value,
+    detail: document.getElementById('m-b-detail').value.trim() || null,
+    sort_order: bs.length+1
+  }).select().single();
+  if(error) { toast('追加エラー','error'); return; }
+  (state.blockers[pid]??=[]).push(data);
+  document.getElementById('modal-overlay').remove();
+  toast('追加しました'); render();
+};
+
+// ─── Render Engine ───
+function render() {
+  const app = document.getElementById('app');
+  if(!state.user) { app.innerHTML = renderAuth(); return; }
+  if(state.loading) { app.innerHTML = renderLoading(); return; }
+  app.innerHTML = renderDashboard();
+}
+
+// ─── Init ───
+async function init() {
+  const { data: { session } } = await sb.auth.getSession();
+  if(session) {
+    state.user = session.user;
+    await loadAllData();
+  } else {
+    render();
+  }
+  // Listen for auth changes
+  sb.auth.onAuthStateChange((event, session) => {
+    state.user = session?.user || null;
+    if(!session) { state.projects=[]; render(); }
+  });
+}
+init();
+</script>
+</body>
+</html>

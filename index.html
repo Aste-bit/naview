@@ -61,6 +61,7 @@ let state = {
   editingProject: null, // null or project obj for modal
   editingBlocker: null,
   editingMilestone: null,
+  showCompleted: false,
 };
 
 // ─── Icons (SVG strings) ───
@@ -101,14 +102,24 @@ const blockerStyles = {
 const projectColors = ['#3b82f6','#10b981','#8b5cf6','#06b6d4','#f59e0b','#ec4899','#6366f1','#ef4444','#14b8a6','#f97316'];
 
 // ─── Toast ───
-function toast(msg, type='success') {
+function toast(msg, type='success', action=null) {
   const c = document.getElementById('toast-container');
   const el = document.createElement('div');
   const colors = type === 'success' ? 'bg-emerald-500' : type === 'error' ? 'bg-red-500' : 'bg-amber-500';
-  el.className = `toast px-4 py-2.5 rounded-xl text-white text-sm font-medium shadow-lg ${colors}`;
-  el.textContent = msg;
+  el.className = `toast px-4 py-2.5 rounded-xl text-white text-sm font-medium shadow-lg ${colors} flex items-center gap-3`;
+  const span = document.createElement('span');
+  span.textContent = msg;
+  el.appendChild(span);
+  if (action) {
+    const btn = document.createElement('button');
+    btn.textContent = action.label;
+    btn.className = 'ml-auto px-2.5 py-1 rounded-lg bg-white/20 hover:bg-white/30 text-xs font-bold transition-all shrink-0';
+    btn.onclick = (e) => { e.stopPropagation(); el.remove(); action.fn(); };
+    el.appendChild(btn);
+  }
   c.appendChild(el);
-  setTimeout(() => { el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),300); }, 2500);
+  const dur = action ? 5000 : 2500;
+  setTimeout(() => { el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),300); }, dur);
 }
 
 // ─── Data Loading ───
@@ -228,6 +239,7 @@ function renderLoading() {
 function renderDashboard() {
   const ps = state.projects;
   const active = ps.filter(p => p.progress < 100);
+  const completed = ps.filter(p => p.progress >= 100);
   const avgProgress = active.length ? Math.round(active.reduce((s,p)=>s+p.progress,0)/active.length) : 0;
 
   const allBlockers = [];
@@ -283,7 +295,7 @@ function renderDashboard() {
       ${renderPillar(icons.helpCircle, '助けを求める', humanItems.length+'件', '#8b5cf6', '人に聞くべき')}
     </div>
 
-    ${state.tab==='overview' ? renderOverviewTab(active, humanItems, aiItems) : renderBlockersTab(humanItems, aiItems)}
+    ${state.tab==='overview' ? renderOverviewTab(active, humanItems, aiItems, completed) : renderBlockersTab(humanItems, aiItems)}
 
     <!-- Footer -->
     <div class="mt-12 text-center pb-6">
@@ -308,7 +320,7 @@ function renderPillar(icon, title, stat, color, desc) {
 }
 
 // ─── Overview Tab ───
-function renderOverviewTab(active, humanItems, aiItems) {
+function renderOverviewTab(active, humanItems, aiItems, completed) {
   const sorted = [...active].sort((a,b) => b.progress-a.progress);
   const sortedCards = [...active].sort((a,b) => {
     const order = {stalled:0, caution:1, good:2};
@@ -351,7 +363,21 @@ function renderOverviewTab(active, humanItems, aiItems) {
     <!-- Project Cards -->
     <div class="pt-2 space-y-3">
       ${sortedCards.map(p => renderCard(p)).join('')}
-    </div>`;
+    </div>
+
+    <!-- Completed Projects -->
+    ${completed.length ? `
+    <div class="mt-6">
+      <button onclick="state.showCompleted=!state.showCompleted;render()" class="flex items-center gap-2 mb-3 group">
+        <div class="w-6 h-6 rounded-lg bg-emerald-50 flex items-center justify-center">
+          <span class="text-emerald-500">${icons.check}</span>
+        </div>
+        <span class="text-xs font-bold text-emerald-600 uppercase tracking-wider">完了プロジェクト</span>
+        <span class="text-[11px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-500">${completed.length}件</span>
+        <span class="text-gray-300 transition-transform ${state.showCompleted?'rotate-180':''}">${icons.chevDown}</span>
+      </button>
+      ${state.showCompleted ? `<div class="space-y-3">${completed.map(p => renderCard(p)).join('')}</div>` : ''}
+    </div>` : ''}`;
 }
 
 function renderAlert(icon, title, color, bg, border, items) {
@@ -595,11 +621,18 @@ window.toggleMilestone = async function(id, done) {
   const { error } = await sb.from('nv_milestones').update({ done }).eq('id', id);
   if(error) { toast('更新エラー','error'); return; }
   // Update local & recalc progress
+  let targetPid = null;
   for(const pid in state.milestones) {
     const m = state.milestones[pid].find(m=>m.id===id);
-    if(m) { m.done = done; await recalcProgress(pid); break; }
+    if(m) { m.done = done; targetPid = pid; await recalcProgress(pid); break; }
   }
   render();
+  // Show undo toast
+  const label = done ? 'マイルストーン完了' : 'マイルストーン戻し';
+  toast(label, 'success', {
+    label: '元に戻す',
+    fn: () => toggleMilestone(id, !done)
+  });
 };
 
 async function recalcProgress(pid) {

@@ -29,64 +29,315 @@
   .btn-primary:hover { filter: brightness(1.05); }
   .toast { animation: toastIn .3s ease; }
   @keyframes toastIn { from { opacity:0; transform:translateY(20px) } to { opacity:1; transform:translateY(0) } }
-  /* Scrollbar */
   ::-webkit-scrollbar { width:6px; }
   ::-webkit-scrollbar-track { background:transparent; }
   ::-webkit-scrollbar-thumb { background:#d1d5db; border-radius:3px; }
+  .settings-dropdown { box-shadow: 0 10px 40px rgba(0,0,0,.12); }
+  .mode-badge { font-size:9px; letter-spacing:.05em; }
 </style>
 </head>
 <body>
-<!-- ═══ APP ROOT ═══ -->
 <div id="app"></div>
-
-<!-- ═══ TOAST CONTAINER ═══ -->
 <div id="toast-container" class="fixed bottom-6 right-6 z-50 flex flex-col gap-2"></div>
 
 <script>
+// ═══════════════════════════════════════════
+// Naview v2 — Local-first + Cloud Sync
+// ═══════════════════════════════════════════
+
 // ─── Config ───
 const SUPABASE_URL = 'https://agghtubnhctbhtvrmphg.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFnZ2h0dWJuaGN0Ymh0dnJtcGhnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM0MjU5MDcsImV4cCI6MjA4OTAwMTkwN30.LZE7Gioevozs3glxXHAuClXA6aXrIEJLKxISAgJOHG0';
-const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+let sb = null;
+try { sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY); } catch(e) { console.warn('Supabase unavailable'); }
 
-// ─── State ───
-let state = {
-  user: null,
-  projects: [],
-  milestones: {},   // { projectId: [...] }
-  blockers: {},     // { projectId: [...] }
-  wins: {},         // { projectId: [...] }
-  loading: true,
-  tab: 'overview',  // overview | blockers
-  expandedId: null,
-  editingProject: null, // null or project obj for modal
-  editingBlocker: null,
-  editingMilestone: null,
-  showCompleted: false,
+// ─── IndexedDB Layer ───
+const idb = {
+  db: null,
+  STORES: ['nv_projects','nv_milestones','nv_blockers','nv_wins'],
+  async open() {
+    if (this.db) return this.db;
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('naview', 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        this.STORES.forEach(name => {
+          if (!db.objectStoreNames.contains(name)) {
+            const store = db.createObjectStore(name, { keyPath: 'id' });
+            if (name !== 'nv_projects') store.createIndex('project_id', 'project_id', { unique: false });
+          }
+        });
+      };
+      req.onsuccess = (e) => { this.db = e.target.result; resolve(this.db); };
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+  async getAll(storeName, orderBy) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readonly');
+      const store = tx.objectStore(storeName);
+      const req = store.getAll();
+      req.onsuccess = () => {
+        let results = req.result || [];
+        if (orderBy) results.sort((a,b) => {
+          if (orderBy === 'created_at') return new Date(b[orderBy]) - new Date(a[orderBy]);
+          return (a[orderBy]||0) - (b[orderBy]||0);
+        });
+        resolve(results);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async getByIndex(storeName, indexName, value) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readonly');
+      const store = tx.objectStore(storeName);
+      const idx = store.index(indexName);
+      const req = idx.getAll(value);
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async put(storeName, data) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readwrite');
+      const store = tx.objectStore(storeName);
+      const req = store.put(data);
+      req.onsuccess = () => resolve(data);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async delete(storeName, id) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readwrite');
+      const store = tx.objectStore(storeName);
+      const req = store.delete(id);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
+  async clear(storeName) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
+  async clearAll() {
+    for (const s of this.STORES) await this.clear(s);
+  }
 };
 
-// ─── Icons (SVG strings) ───
+// ─── Data Layer (abstracts Local vs Cloud) ───
+const dl = {
+  isLocal() { return state.mode === 'local'; },
+
+  async loadProjects() {
+    if (this.isLocal()) {
+      return { data: await idb.getAll('nv_projects', 'sort_order'), error: null };
+    }
+    return await sb.from('nv_projects').select('*').order('sort_order');
+  },
+  async loadRelated(ids) {
+    if (this.isLocal()) {
+      const milestones = []; const blockers = []; const wins = [];
+      for (const id of ids) {
+        milestones.push(...await idb.getByIndex('nv_milestones','project_id',id));
+        blockers.push(...await idb.getByIndex('nv_blockers','project_id',id));
+        wins.push(...await idb.getByIndex('nv_wins','project_id',id));
+      }
+      milestones.sort((a,b)=>(a.sort_order||0)-(b.sort_order||0));
+      blockers.sort((a,b)=>(a.sort_order||0)-(b.sort_order||0));
+      wins.sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+      return [{ data: milestones }, { data: blockers }, { data: wins }];
+    }
+    return await Promise.all([
+      sb.from('nv_milestones').select('*').in('project_id', ids).order('sort_order'),
+      sb.from('nv_blockers').select('*').in('project_id', ids).order('sort_order'),
+      sb.from('nv_wins').select('*').in('project_id', ids).order('created_at', { ascending: false }),
+    ]);
+  },async insertProject(data) {
+    if (this.isLocal()) {
+      data.id = crypto.randomUUID();
+      await idb.put('nv_projects', data);
+      return { data, error: null };
+    }
+    return await sb.from('nv_projects').insert(data).select().single();
+  },
+  async updateProject(id, data) {
+    if (this.isLocal()) {
+      const all = await idb.getAll('nv_projects');
+      const p = all.find(x=>x.id===id);
+      if (p) { Object.assign(p, data); await idb.put('nv_projects', p); }
+      return { error: null };
+    }
+    return await sb.from('nv_projects').update(data).eq('id', id);
+  },
+  async deleteProject(id) {
+    if (this.isLocal()) {
+      await idb.delete('nv_projects', id);
+      // cascade delete related
+      const ms = await idb.getByIndex('nv_milestones','project_id',id);
+      const bs = await idb.getByIndex('nv_blockers','project_id',id);
+      const ws = await idb.getByIndex('nv_wins','project_id',id);
+      for (const m of ms) await idb.delete('nv_milestones', m.id);
+      for (const b of bs) await idb.delete('nv_blockers', b.id);
+      for (const w of ws) await idb.delete('nv_wins', w.id);
+      return { error: null };
+    }
+    return await sb.from('nv_projects').delete().eq('id', id);
+  },
+  async insertMilestone(data) {
+    if (this.isLocal()) {
+      data.id = crypto.randomUUID();
+      await idb.put('nv_milestones', data);
+      return { data, error: null };
+    }
+    return await sb.from('nv_milestones').insert(data).select().single();
+  },
+  async updateMilestone(id, data) {
+    if (this.isLocal()) {
+      const all = await idb.getAll('nv_milestones');
+      const m = all.find(x=>x.id===id);
+      if (m) { Object.assign(m, data); await idb.put('nv_milestones', m); }
+      return { error: null };
+    }
+    return await sb.from('nv_milestones').update(data).eq('id', id);
+  },
+  async deleteMilestone(id) {
+    if (this.isLocal()) { await idb.delete('nv_milestones', id); return { error: null }; }
+    return await sb.from('nv_milestones').delete().eq('id', id);
+  },
+  async insertBlocker(data) {
+    if (this.isLocal()) {
+      data.id = crypto.randomUUID();
+      await idb.put('nv_blockers', data);
+      return { data, error: null };
+    }
+    return await sb.from('nv_blockers').insert(data).select().single();
+  },
+  async updateBlocker(id, data) {
+    if (this.isLocal()) {
+      const all = await idb.getAll('nv_blockers');
+      const b = all.find(x=>x.id===id);
+      if (b) { Object.assign(b, data); await idb.put('nv_blockers', b); }
+      return { error: null };
+    }
+    return await sb.from('nv_blockers').update(data).eq('id', id);
+  },
+  async deleteBlocker(id) {
+    if (this.isLocal()) { await idb.delete('nv_blockers', id); return { error: null }; }
+    return await sb.from('nv_blockers').delete().eq('id', id);
+  },
+  async insertWin(data) {
+    if (this.isLocal()) {
+      data.id = crypto.randomUUID();
+      data.created_at = data.created_at || new Date().toISOString();
+      await idb.put('nv_wins', data);
+      return { data, error: null };
+    }
+    return await sb.from('nv_wins').insert(data).select().single();
+  },
+  async deleteWin(id) {
+    if (this.isLocal()) { await idb.delete('nv_wins', id); return { error: null }; }
+    return await sb.from('nv_wins').delete().eq('id', id);
+  },
+  async updateProjectProgress(id, progress) {
+    return await this.updateProject(id, { progress });
+  },
+
+  // ─── Export / Import ───
+  async exportAll() {
+    let projects, milestones, blockers, wins;
+    if (this.isLocal()) {
+      projects = await idb.getAll('nv_projects','sort_order');
+      milestones = await idb.getAll('nv_milestones','sort_order');
+      blockers = await idb.getAll('nv_blockers','sort_order');
+      wins = await idb.getAll('nv_wins','created_at');
+    } else {
+      projects = state.projects;
+      milestones = Object.values(state.milestones).flat();
+      blockers = Object.values(state.blockers).flat();
+      wins = Object.values(state.wins).flat();
+    }
+    return {
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      app: 'naview',
+      data: { projects, milestones, blockers, wins }
+    };
+  },
+  async importAll(json) {
+    const { data: d } = json;
+    if (!d || !d.projects) throw new Error('Invalid format');
+    if (this.isLocal()) {
+      await idb.clearAll();
+      for (const p of d.projects) await idb.put('nv_projects', p);
+      for (const m of d.milestones||[]) await idb.put('nv_milestones', m);
+      for (const b of d.blockers||[]) await idb.put('nv_blockers', b);
+      for (const w of d.wins||[]) await idb.put('nv_wins', w);
+    } else {
+      // Cloud import: insert each record via Supabase
+      const uid = state.user.id;
+      for (const p of d.projects) {
+        p.user_id = uid;
+        await sb.from('nv_projects').upsert(p);
+      }
+      for (const m of d.milestones||[]) { m.user_id = uid; await sb.from('nv_milestones').upsert(m); }
+      for (const b of d.blockers||[]) { b.user_id = uid; await sb.from('nv_blockers').upsert(b); }
+      for (const w of d.wins||[]) { w.user_id = uid; await sb.from('nv_wins').upsert(w); }
+    }
+  }
+};
+// ─── State ───
+let state = {
+  mode: localStorage.getItem('nv_mode') || null, // 'local' | 'cloud' | null (choosing)
+  user: null,
+  projects: [],
+  milestones: {},
+  blockers: {},
+  wins: {},
+  loading: true,
+  tab: 'overview',
+  expandedId: null,
+  showCompleted: false,
+  settingsOpen: false,
+};
+
+// ─── Icons ───
 const icons = {
-  barChart: `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>`,
-  target: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>`,
-  eye: `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`,
-  alertTri: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
-  helpCircle: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
-  check: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
-  zap: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
-  users: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
-  layers: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>`,
-  star: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
-  shield: `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
-  activity: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`,
-  chevDown: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
-  chevRight: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>`,
-  arrowRight: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>`,
-  plus: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
-  edit: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`,
-  trash: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`,
-  x: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
-  logout: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>`,
-  msgCircle: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>`,
+  barChart: `<svg width='22" height='22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1='18" y1='20" x2='18" y2='10"/><line x1='12" y1='20" x2='12" y2='4"/><line x1='6" y1='20" x2='6" y2='14"/></svg>`,
+  target: `<svg width='14" height='14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx='12" cy='12" r='10"/><circle cx='12" cy='12" r='6"/><circle cx='12" cy='12" r='2"/></svg>`,
+  eye: `<svg width='20" height='20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx='12" cy='12" r='3"/></svg>`,
+  alertTri: `<svg width='14" height='14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1='12" y1='9" x2='12" y2='13"/><line x1='12" y1='17" x2='12.01" y2='17"/></svg>`,
+  helpCircle: `<svg width='14" height='14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx='12" cy="12" r='10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1='12" y1='17" x2='12.01" y2='17"/></svg>`,
+  check: `<svg width='12" height='12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='3" stroke-linecap="round" stroke-linejoin="round"><polyline points='20 6 9 17 4 12"/></svg>`,
+  zap: `<svg width='15" height='15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><polygon points='13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
+  users: `<svg width='15" height='15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx='9" cy='7" r='4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+  layers: `<svg width='12" height='12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><polygon points='12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>`,
+  star: `<svg width='12" height='12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><polygon points='12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
+  shield: `<svg width='22" height='22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
+  activity: `<svg width='13" height='13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><polyline points='22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`,
+  chevDown: `<svg width='16" height='16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
+  chevRight: `<svg width='14" height='14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>`,
+  arrowRight: `<svg width='13" height='13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><line x1='5" y1='12" x2='19" y2='12"/><polyline points='12 5 19 12 12 19"/></svg>`,
+  plus: `<svg width='16" height='16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><line x1='12" y1='5" x2='12" y2='19"/><line x1='5" y1='12" x2='19" y2='12"/></svg>`,
+  edit: `<svg width='13" height='13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`,
+  trash: `<svg width='13" height='13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`,
+  x: `<svg width='18" height='18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><line x1='18" y1='6" x2='6" y2='18"/><line x1='6" y1='6" x2='18" y2='18"/></svg>`,
+  logout: `<svg width='16" height='16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1='21" y1='12" x2="9" y2="12"/></svg>`,
+  msgCircle: `<svg width='15" height='15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>`,
+  gear: `<svg width='16" height='16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><circle cx='12" cy='12" r='3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>`,
+  download: `<svg width='14" height='14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1='12" y1="15" x2="12" y2="3"/></svg>`,
+  upload: `<svg width='14" height='14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1='12" y1="3" x2="12" y2="15"/></svg>`,
+  cloud: `<svg width='14" height='14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>`,
+  database: `<svg width='14" height='14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width='2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx='12" cy='5" rx='9" ry='3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>`,
 };
 
 const healthMap = {
@@ -121,28 +372,23 @@ function toast(msg, type='success', action=null) {
   const dur = action ? 5000 : 2500;
   setTimeout(() => { el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),300); }, dur);
 }
-
 // ─── Data Loading ───
 async function loadAllData() {
   state.loading = true;
   render();
   try {
-    const { data: projects, error: pe } = await sb.from('nv_projects').select('*').order('sort_order');
+    const { data: projects, error: pe } = await dl.loadProjects();
     if (pe) throw pe;
     state.projects = projects || [];
-    // Load related data for all projects
     const ids = state.projects.map(p => p.id);
     if (ids.length) {
-      const [mRes, bRes, wRes] = await Promise.all([
-        sb.from('nv_milestones').select('*').in('project_id', ids).order('sort_order'),
-        sb.from('nv_blockers').select('*').in('project_id', ids).order('sort_order'),
-        sb.from('nv_wins').select('*').in('project_id', ids).order('created_at', { ascending: false }),
-      ]);
-      // Group by project_id
+      const [mRes, bRes, wRes] = await dl.loadRelated(ids);
       state.milestones = {}; state.blockers = {}; state.wins = {};
       (mRes.data || []).forEach(m => { (state.milestones[m.project_id] ??= []).push(m); });
       (bRes.data || []).forEach(b => { (state.blockers[b.project_id] ??= []).push(b); });
       (wRes.data || []).forEach(w => { (state.wins[w.project_id] ??= []).push(w); });
+    } else {
+      state.milestones = {}; state.blockers = {}; state.wins = {};
     }
   } catch(e) {
     console.error(e);
@@ -168,7 +414,66 @@ function ring(progress, size=56, color='#3b82f6') {
   </div>`;
 }
 
-// ─── Render: Auth Screen ───
+// ─── Render: Mode Selection ───
+function renderModeSelect() {
+  return `
+  <div class="min-h-screen flex items-center justify-center p-4" style="background:linear-gradient(180deg,#f8fafc 0%,#f1f5f9 100%)">
+    <div class="w-full max-w-md fade-in">
+      <div class="text-center mb-8">
+        <div class="w-16 h-16 rounded-2xl flex items-center justify-center shadow-lg mx-auto mb-4"
+          style="background:linear-gradient(135deg,#6366f1 0%,#8b5cf6 50%,#a78bfa 100%)">
+          <span class="text-white">${icons.barChart}</span>
+        </div>
+        <h1 class="text-2xl font-extrabold text-gray-800">Naview</h1>
+        <p class="text-sm text-gray-400 mt-1">Navigate your work, view your growth</p>
+      </div>
+      <div class="grid gap-4">
+        <button onclick="startLocalMode()" class="bg-white rounded-2xl p-6 border border-gray-100 shadow-sm card-hover text-left group">
+          <div class="flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl flex items-center justify-center bg-emerald-50 group-hover:scale-105 transition-transform">
+              <span class="text-emerald-500">${icons.database}</span>
+            </div>
+            <div class="flex-1">
+              <h3 class="text-base font-bold text-gray-800">ローカルで使う</h3>
+              <p class="text-xs text-gray-400 mt-0.5">ログイン不要・ブラウザに保存</p>
+              <p class="text-[11px] text-emerald-500 font-medium mt-1">HTMLを渡すだけで誰でも使える</p>
+            </div>
+            <span class="text-gray-300 group-hover:text-indigo-400 transition-colors">${icons.chevRight}</span>
+          </div>
+        </button>
+        <button onclick="startCloudMode()" class="bg-white rounded-2xl p-6 border border-gray-100 shadow-sm card-hover text-left group">
+          <div class="flex items-center gap-4">
+            <div class="w-12 h-12 rounded-xl flex items-center justify-center bg-blue-50 group-hover:scale-105 transition-transform">
+              <span class="text-blue-500">${icons.cloud}</span>
+            </div>
+            <div class="flex-1">
+              <h3 class="text-base font-bold text-gray-800">クラウド同期</h3>
+              <p class="text-xs text-gray-400 mt-0.5">Supabaseでログイン・複数端末対応</p>
+              <p class="text-[11px] text-blue-500 font-medium mt-1">データをクラウドに安全に保存</p>
+            </div>
+            <span class="text-gray-300 group-hover:text-indigo-400 transition-colors">${icons.chevRight}</span>
+          </div>
+        </button>
+      </div>
+    </div>
+  </div>`;
+}
+
+window.startLocalMode = async function() {
+  state.mode = 'local';
+  localStorage.setItem('nv_mode', 'local');
+  state.user = { id: 'local-user', email: 'ローカル' };
+  await idb.open();
+  await loadAllData();
+};
+
+window.startCloudMode = function() {
+  state.mode = 'cloud';
+  localStorage.setItem('nv_mode', 'cloud');
+  render();
+};
+
+// ─── Render: Auth Screen (Cloud only) ───
 function renderAuth() {
   return `
   <div class="min-h-screen flex items-center justify-center p-4" style="background:linear-gradient(180deg,#f8fafc 0%,#f1f5f9 100%)">
@@ -196,9 +501,19 @@ function renderAuth() {
         <button onclick="doAuth()" id="auth-btn"
           class="w-full btn-primary text-white font-bold py-3 rounded-xl text-sm transition-all">ログイン</button>
       </div>
+      <button onclick="goBackToModeSelect()" class="w-full mt-4 text-xs text-gray-400 hover:text-gray-600 transition-colors py-2">
+        ← モード選択に戻る
+      </button>
     </div>
   </div>`;
 }
+
+window.goBackToModeSelect = function() {
+  state.mode = null;
+  localStorage.removeItem('nv_mode');
+  render();
+};
+
 let authTab = 'login';
 window.switchAuthTab = function(t) {
   authTab = t;
@@ -241,10 +556,7 @@ function renderDashboard() {
   const active = ps.filter(p => p.progress < 100);
   const completed = ps.filter(p => p.progress >= 100);
   const avgProgress = active.length ? Math.round(active.reduce((s,p)=>s+p.progress,0)/active.length) : 0;
-
-  const allBlockers = [];
-  const humanItems = [];
-  const aiItems = [];
+  const allBlockers = []; const humanItems = []; const aiItems = [];
   ps.forEach(p => {
     (state.blockers[p.id]||[]).forEach(b => {
       const item = { project: p.name, projectColor: p.color, ...b };
@@ -254,10 +566,11 @@ function renderDashboard() {
     });
   });
   const totalBlockers = humanItems.length + aiItems.length;
+  const modeLabel = state.mode === 'local' ? 'ローカル' : 'クラウド';
+  const modeBg = state.mode === 'local' ? 'bg-emerald-50 text-emerald-600' : 'bg-blue-50 text-blue-600';
 
   return `
   <div class="max-w-5xl mx-auto px-4 sm:px-6 py-8 fade-in">
-    <!-- Header -->
     <div class="flex items-center justify-between mb-8">
       <div class="flex items-center gap-3">
         <div class="w-11 h-11 rounded-2xl flex items-center justify-center shadow-lg"
@@ -281,10 +594,22 @@ function renderDashboard() {
             ${totalBlockers>0?`<span class="w-5 h-5 rounded-full text-[10px] flex items-center justify-center font-bold ${state.tab==='blockers'?'bg-white/20 text-white':'bg-amber-100 text-amber-600'}">${totalBlockers}</span>`:''}
           </button>
         </div>
-        <button onclick="doLogout()" class="w-8 h-8 rounded-lg flex items-center justify-center text-gray-300 hover:text-gray-500 hover:bg-gray-100 transition-all" title="ログアウト">
-          ${icons.logout}
-        </button>
+        <!-- Settings -->
+        <div class="relative">
+          <button onclick="toggleSettings()" class="w-8 h-8 rounded-lg flex items-center justify-center text-gray-300 hover:text-gray-500 hover:bg-gray-100 transition-all" title="設定">
+            ${icons.gear}
+          </button>
+          ${state.settingsOpen ? renderSettingsDropdown(modeLabel, modeBg) : ''}
+        </div>
       </div>
+    </div>
+
+    <!-- Mode Badge -->
+    <div class="flex items-center gap-2 mb-6">
+      <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full mode-badge font-bold uppercase tracking-wider ${modeBg}">
+        ${state.mode==='local'?icons.database:icons.cloud} ${modeLabel}モード
+      </span>
+      ${state.mode==='cloud'&&state.user?`<span class="text-[11px] text-gray-400">${esc(state.user.email)}</span>`:''}
     </div>
 
     <!-- 4 Pillars -->
@@ -297,7 +622,6 @@ function renderDashboard() {
 
     ${state.tab==='overview' ? renderOverviewTab(active, humanItems, aiItems, completed) : renderBlockersTab(humanItems, aiItems)}
 
-    <!-- Footer -->
     <div class="mt-12 text-center pb-6">
       <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white border border-gray-100 shadow-sm">
         <div class="w-1.5 h-1.5 rounded-full bg-indigo-400"></div>
@@ -306,6 +630,103 @@ function renderDashboard() {
     </div>
   </div>`;
 }
+
+function renderSettingsDropdown(modeLabel, modeBg) {
+  return `<div class="absolute right-0 top-10 w-56 bg-white rounded-xl border border-gray-100 settings-dropdown z-50 overflow-hidden fade-in" onclick="event.stopPropagation()">
+    <div class="px-4 py-3 border-b border-gray-50">
+      <span class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">データモード</span>
+      <div class="flex items-center gap-2 mt-1">
+        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${modeBg}">
+          ${state.mode==='local'?icons.database:icons.cloud} ${modeLabel}
+        </span>
+      </div>
+    </div>
+    <div class="py-1">
+      <button onclick="doExport()" class="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-gray-600 hover:bg-gray-50 transition-all">
+        <span class="text-gray-400">${icons.download}</span> エクスポート (JSON)
+      </button>
+      <button onclick="doImport()" class="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-gray-600 hover:bg-gray-50 transition-all">
+        <span class="text-gray-400">${icons.upload}</span> インポート (JSON)
+      </button>
+      <div class="h-px bg-gray-100 mx-3"></div>
+      <button onclick="switchMode()" class="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-gray-600 hover:bg-gray-50 transition-all">
+        <span class="text-gray-400">${state.mode==='local'?icons.cloud:icons.database}</span>
+        ${state.mode==='local'?'クラウドモードに切替':'ローカルモードに切替'}
+      </button>
+      ${state.mode==='cloud'?`
+      <button onclick="doLogout()" class="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-red-500 hover:bg-red-50 transition-all">
+        <span class="text-red-400">${icons.logout}</span> ログアウト
+      </button>`:''}
+    </div>
+  </div>`;
+}
+
+window.toggleSettings = function() {
+  state.settingsOpen = !state.settingsOpen;
+  render();
+};
+
+// Close settings on outside click
+document.addEventListener('click', (e) => {
+  if (state.settingsOpen && !e.target.closest('.relative')) {
+    state.settingsOpen = false;
+    render();
+  }
+});
+
+window.doExport = async function() {
+  state.settingsOpen = false;
+  try {
+    const data = await dl.exportAll();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `naview-export-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('エクスポート完了');
+  } catch(e) {
+    console.error(e);
+    toast('エクスポートエラー','error');
+  }
+  render();
+};
+
+window.doImport = function() {
+  state.settingsOpen = false;
+  render();
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json';
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const json = JSON.parse(text);
+      if (!json.data || !json.data.projects) { toast('無効なファイル形式','error'); return; }
+      if (!confirm(`${json.data.projects.length}件のプロジェクトをインポートしますか？\n現在のデータは上書きされます。`)) return;
+      await dl.importAll(json);
+      await loadAllData();
+      toast(`${json.data.projects.length}件インポート完了`);
+    } catch(err) {
+      console.error(err);
+      toast('インポートエラー','error');
+    }
+  };
+  input.click();
+};
+
+window.switchMode = function() {
+  state.settingsOpen = false;
+  state.mode = null;
+  state.user = null;
+  state.projects = [];
+  state.milestones = {}; state.blockers = {}; state.wins = {};
+  localStorage.removeItem('nv_mode');
+  render();
+};
 
 function renderPillar(icon, title, stat, color, desc) {
   return `<div class="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm card-hover group">
@@ -326,16 +747,12 @@ function renderOverviewTab(active, humanItems, aiItems, completed) {
     const order = {stalled:0, caution:1, good:2};
     return (order[a.health]??3)-(order[b.health]??3);
   });
-
   return `
-    <!-- Add Project Button -->
     <div class="mb-4 flex justify-end">
       <button onclick="openProjectModal()" class="flex items-center gap-1.5 px-4 py-2 rounded-xl btn-primary text-white text-xs font-semibold shadow-sm hover:shadow transition-all">
         ${icons.plus} プロジェクト追加
       </button>
     </div>
-
-    <!-- Overview Bar -->
     <div class="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm mb-4">
       <div class="flex items-center justify-between mb-4">
         <span class="text-xs font-bold text-gray-400 uppercase tracking-wider">全プロジェクト進捗</span>
@@ -355,17 +772,11 @@ function renderOverviewTab(active, humanItems, aiItems, completed) {
         }).join('')}
       </div>
     </div>
-
-    <!-- Action Alerts -->
     ${renderAlert(icons.users, '人に聞いた方がいい', '#8b5cf6', 'bg-violet-50/50', 'border-violet-100', humanItems)}
     ${renderAlert(icons.zap, 'AIが今すぐ対応できる', '#3b82f6', 'bg-blue-50/50', 'border-blue-100', aiItems)}
-
-    <!-- Project Cards -->
     <div class="pt-2 space-y-3">
       ${sortedCards.map(p => renderCard(p)).join('')}
     </div>
-
-    <!-- Completed Projects -->
     ${completed.length ? `
     <div class="mt-6">
       <button onclick="state.showCompleted=!state.showCompleted;render()" class="flex items-center gap-2 mb-3 group">
@@ -410,7 +821,6 @@ function renderCard(p) {
   const human = bs.filter(b=>b.type==='human');
   const ai = bs.filter(b=>b.type==='ai');
   const expanded = state.expandedId === p.id;
-
   return `<div class="bg-white rounded-2xl border border-gray-100 overflow-hidden transition-all duration-300 shadow-sm card-hover" data-expanded="${expanded}">
     <div class="h-1 w-full" style="background:${p.color}"></div>
     <div class="p-5 cursor-pointer" onclick="toggleExpand('${p.id}')">
@@ -440,7 +850,6 @@ function renderCard(p) {
     <div class="card-detail">
       <div class="px-5 pb-5 space-y-5">
         <div class="h-px bg-gray-100"></div>
-        <!-- Edit/Delete -->
         <div class="flex gap-2">
           <button onclick="openProjectModal('${p.id}')" class="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium text-gray-500 bg-gray-50 hover:bg-gray-100 transition-all">
             ${icons.edit} 編集
@@ -449,7 +858,6 @@ function renderCard(p) {
             ${icons.trash} 削除
           </button>
         </div>
-        <!-- Goal -->
         ${p.done_image ? `<div class="rounded-xl p-4 border border-gray-100 bg-gray-50/50">
           <div class="flex items-center gap-2 mb-2">
             <span class="text-indigo-400">${icons.target}</span>
@@ -457,9 +865,7 @@ function renderCard(p) {
           </div>
           <p class="text-sm text-gray-600 leading-relaxed">${esc(p.done_image)}</p>
         </div>` : ''}
-        <!-- Two columns -->
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <!-- Milestones -->
           <div class="rounded-xl p-4 bg-gray-50/50 border border-gray-100">
             <div class="flex items-center justify-between mb-3">
               <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
@@ -490,7 +896,6 @@ function renderCard(p) {
               </div>`).join('')}
             </div>
           </div>
-          <!-- Blockers -->
           <div class="space-y-2.5">
             <div class="flex items-center justify-between">
               <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
@@ -509,7 +914,6 @@ function renderCard(p) {
             </div>`}
           </div>
         </div>
-        <!-- Wins -->
         <div>
           <div class="flex items-center justify-between mb-2">
             <span class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
@@ -542,7 +946,7 @@ function renderBlocker(b, pid) {
         ${b.detail?`<p class="text-xs text-gray-400 mt-1"><span class="font-semibold text-gray-500">Next →</span> ${esc(b.detail)}</p>`:''}
       </div>
       <div class="flex items-center gap-1 shrink-0">
-        <button onclick="cycleBlockerType('${b.id}','${b.type}','${pid}')" class="text-gray-300 hover:text-gray-500 transition-all" title="タイプ変更">
+        <button onclick="cycleBlockerType('${b.id}','${b.type}','${pid}')" class="text-gray-300 hover:text-gray-500 transition-all" title="タイプ変書">
           ${icons.edit}
         </button>
         <button onclick="deleteBlocker('${b.id}','${pid}')" class="text-gray-300 hover:text-red-400 transition-all" title="削除">
@@ -561,9 +965,7 @@ function renderBlockersTab(humanItems, aiItems) {
       solvedItems.push({ project: p.name, projectColor: p.color, ...b });
     });
   });
-
   return `
-    <!-- Human -->
     <div class="mb-6">
       <div class="flex items-center gap-2 mb-3">
         <div class="w-8 h-8 rounded-xl bg-violet-50 flex items-center justify-center"><span class="text-violet-500">${icons.users}</span></div>
@@ -573,7 +975,6 @@ function renderBlockersTab(humanItems, aiItems) {
       ${humanItems.length===0 ? '<div class="text-center py-10 text-gray-300 text-sm bg-white rounded-2xl border border-gray-100">なし</div>' :
         `<div class="space-y-2">${groupBlockersByProject(humanItems,'violet').join('')}</div>`}
     </div>
-    <!-- AI -->
     <div class="mb-6">
       <div class="flex items-center gap-2 mb-3">
         <div class="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center"><span class="text-blue-500">${icons.zap}</span></div>
@@ -583,7 +984,29 @@ function renderBlockersTab(humanItems, aiItems) {
       ${aiItems.length===0 ? '<div class="text-center py-10 text-gray-300 text-sm bg-white rounded-2xl border border-gray-100">なし</div>' :
         `<div class="space-y-2">${groupBlockersByProject(aiItems,'blue').join('')}</div>`}
     </div>
-    <!-- Solved -->
+    <div>
+      <div class="flex items-center gap-2 mb-3">
+        <div class="w-8 h-8 rounded-xl bg-emerald-50 flex items-center justify-center"><span class="text-emerald-500">${icons.check}</span></div>
+        <h2 class="text-sm font-bold text-gray-700">解決済み</h2>
+      </div>
+      ${solvedItems.length===0 ? '<div class="text-center py-10 text-gray-300 text-sm bg-white rounded-2xl border border-gray-100">なし</div>' :
+        `<div class="space-y-2">${groupBlockersByProject(solvedItems,'emerald',true).join('')}</div>`}
+    </div>`;
+}題</h2>
+        <span class="ml-auto text-xs font-bold text-violet-500 bg-violet-50 px-2 py-0.5 rounded-full">${humanItems.length}件</span>
+      </div>
+      ${humanItems.length===0 ? '<div class="text-center py-10 text-gray-300 text-sm bg-white rounded-2xl border border-gray-100">なし</div>' :
+        `<div class="space-y-2">${groupBlockersByProject(humanItems,'violet').join('')}</div>`}
+    </div>
+    <div class="mb-6">
+      <div class="flex items-center gap-2 mb-3">
+        <div class="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center"><span class="text-blue-500">${icons.zap}</span></div>
+        <h2 class="text-sm font-bold text-gray-700">AIが対応できる課題</h2>
+        <span class="ml-auto text-xs font-bold text-blue-500 bg-blue-50 px-2 py-0.5 rounded-full">${aiItems.length}件</span>
+      </div>
+      ${aiItems.length===0 ? '<div class="text-center py-10 text-gray-300 text-sm bg-white rounded-2xl border border-gray-100">なし</div>' :
+        `<div class="space-y-2">${groupBlockersByProject(aiItems,'blue').join('')}</div>`}
+    </div>
     <div>
       <div class="flex items-center gap-2 mb-3">
         <div class="w-8 h-8 rounded-xl bg-emerald-50 flex items-center justify-center"><span class="text-emerald-500">${icons.check}</span></div>
@@ -615,38 +1038,38 @@ function groupBlockersByProject(items, colorName, faded=false) {
 // ─── CRUD Actions ───
 window.setTab = function(t) { state.tab = t; render(); };
 window.toggleExpand = function(id) { state.expandedId = state.expandedId===id ? null : id; render(); };
-window.doLogout = async function() { await sb.auth.signOut(); state.user=null; state.projects=[]; render(); };
+window.doLogout = async function() {
+  if (state.mode === 'cloud' && sb) await sb.auth.signOut();
+  state.user = null; state.projects = []; state.mode = null;
+  localStorage.removeItem('nv_mode');
+  render();
+};
 
 window.toggleMilestone = async function(id, done) {
-  const { error } = await sb.from('nv_milestones').update({ done }).eq('id', id);
+  const { error } = await dl.updateMilestone(id, { done });
   if(error) { toast('更新エラー','error'); return; }
-  // Update local & recalc progress
   let targetPid = null;
   for(const pid in state.milestones) {
     const m = state.milestones[pid].find(m=>m.id===id);
     if(m) { m.done = done; targetPid = pid; await recalcProgress(pid); break; }
   }
   render();
-  // Show undo toast
   const label = done ? 'マイルストーン完了' : 'マイルストーン戻し';
-  toast(label, 'success', {
-    label: '元に戻す',
-    fn: () => toggleMilestone(id, !done)
-  });
+  toast(label, 'success', { label: '元に戻す', fn: () => toggleMilestone(id, !done) });
 };
 
 async function recalcProgress(pid) {
   const ms = state.milestones[pid]||[];
   if(!ms.length) return;
   const progress = Math.round((ms.filter(m=>m.done).length / ms.length) * 100);
-  await sb.from('nv_projects').update({ progress }).eq('id', pid);
+  await dl.updateProjectProgress(pid, progress);
   const p = state.projects.find(p=>p.id===pid);
   if(p) p.progress = progress;
 }
 
 window.deleteProject = async function(id) {
   if(!confirm('このプロジェクトを削除しますか？')) return;
-  const { error } = await sb.from('nv_projects').delete().eq('id', id);
+  const { error } = await dl.deleteProject(id);
   if(error) { toast('削除エラー','error'); return; }
   state.projects = state.projects.filter(p=>p.id!==id);
   delete state.milestones[id]; delete state.blockers[id]; delete state.wins[id];
@@ -655,7 +1078,7 @@ window.deleteProject = async function(id) {
 };
 
 window.deleteMilestone = async function(id, pid) {
-  const { error } = await sb.from('nv_milestones').delete().eq('id', id);
+  const { error } = await dl.deleteMilestone(id);
   if(error) { toast('削除エラー','error'); return; }
   state.milestones[pid] = (state.milestones[pid]||[]).filter(m=>m.id!==id);
   await recalcProgress(pid);
@@ -663,14 +1086,14 @@ window.deleteMilestone = async function(id, pid) {
 };
 
 window.deleteBlocker = async function(id, pid) {
-  const { error } = await sb.from('nv_blockers').delete().eq('id', id);
+  const { error } = await dl.deleteBlocker(id);
   if(error) { toast('削除エラー','error'); return; }
   state.blockers[pid] = (state.blockers[pid]||[]).filter(b=>b.id!==id);
   toast('削除しました'); render();
 };
 
 window.deleteWin = async function(id, pid) {
-  const { error } = await sb.from('nv_wins').delete().eq('id', id);
+  const { error } = await dl.deleteWin(id);
   if(error) { toast('削除エラー','error'); return; }
   state.wins[pid] = (state.wins[pid]||[]).filter(w=>w.id!==id);
   toast('削除しました'); render();
@@ -679,7 +1102,7 @@ window.deleteWin = async function(id, pid) {
 window.cycleBlockerType = async function(id, current, pid) {
   const order = ['ai','human','solved'];
   const next = order[(order.indexOf(current)+1) % order.length];
-  const { error } = await sb.from('nv_blockers').update({ type: next }).eq('id', id);
+  const { error } = await dl.updateBlocker(id, { type: next });
   if(error) { toast('更新エラー','error'); return; }
   const b = (state.blockers[pid]||[]).find(b=>b.id===id);
   if(b) b.type = next;
@@ -689,7 +1112,7 @@ window.cycleBlockerType = async function(id, current, pid) {
 window.addWin = async function(pid) {
   const text = prompt('成果を入力:');
   if(!text?.trim()) return;
-  const { data, error } = await sb.from('nv_wins').insert({ project_id: pid, user_id: state.user.id, text: text.trim() }).select().single();
+  const { data, error } = await dl.insertWin({ project_id: pid, user_id: state.user.id, text: text.trim() });
   if(error) { toast('追加エラー','error'); return; }
   (state.wins[pid]??=[]).unshift(data);
   toast('追加しました'); render();
@@ -728,185 +1151,35 @@ window.openProjectModal = function(id) {
           <select id="m-health" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
             <option value="good" ${p?.health==='good'?'selected':''}>順調</option>
             <option value="caution" ${(!p||p?.health==='caution')?'selected':''}>要注意</option>
-            <option value="stalled" ${p?.health==='stalled'?'selected':''}>停滞</option>
-          </select>
-        </div>
-      </div>
-      <div>
-        <label class="text-xs font-semibold text-gray-500 mb-1 block">ゴール</label>
-        <textarea id="m-goal" rows="2" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm resize-none">${esc(p?.goal||'')}</textarea>
-      </div>
-      <div>
-        <label class="text-xs font-semibold text-gray-500 mb-1 block">完成イメージ</label>
-        <textarea id="m-doneimg" rows="2" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm resize-none">${esc(p?.done_image||'')}</textarea>
-      </div>
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="text-xs font-semibold text-gray-500 mb-1 block">フェーズ</label>
-          <input id="m-phase" value="${esc(p?.phase||'')}" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
-        </div>
-        <div>
-          <label class="text-xs font-semibold text-gray-500 mb-1 block">オーナー</label>
-          <input id="m-owner" value="${esc(p?.owner||'')}" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm" placeholder="例: Cowork + 自分">
-        </div>
-      </div>
-      ${!isNew ? `<div>
-        <label class="text-xs font-semibold text-gray-500 mb-1 block">進捗 (${p.progress}%)</label>
-        <input type="range" id="m-progress" min="0" max="100" value="${p.progress}" class="w-full"
-          oninput="document.getElementById('m-prog-label').textContent=this.value+'%'">
-        <span id="m-prog-label" class="text-xs text-gray-400">${p.progress}%</span>
-      </div>` : ''}
-    </div>
-    <div class="px-6 py-4 border-t border-gray-100 flex justify-end gap-2">
-      <button onclick="document.getElementById('modal-overlay').remove()" class="px-4 py-2 rounded-xl text-sm font-medium text-gray-500 hover:bg-gray-50">キャンセル</button>
-      <button onclick="saveProject('${id||''}')" class="px-5 py-2 rounded-xl text-sm font-semibold text-white btn-primary">保存</button>
-    </div>
-  </div>`;
-  document.body.appendChild(modal);
-};
-
-window.saveProject = async function(id) {
-  const name = document.getElementById('m-name').value.trim();
-  if(!name) { toast('名前を入力してください','error'); return; }
-  const data = {
-    name,
-    color: document.getElementById('m-color-val').value,
-    health: document.getElementById('m-health').value,
-    goal: document.getElementById('m-goal').value.trim(),
-    done_image: document.getElementById('m-doneimg').value.trim(),
-    phase: document.getElementById('m-phase').value.trim(),
-    owner: document.getElementById('m-owner').value.trim(),
-  };
-  if(id) {
-    // Update
-    const progEl = document.getElementById('m-progress');
-    if(progEl) data.progress = parseInt(progEl.value);
-    const { error } = await sb.from('nv_projects').update(data).eq('id', id);
-    if(error) { toast('更新エラー','error'); return; }
-    const p = state.projects.find(p=>p.id===id);
-    if(p) Object.assign(p, data);
-  } else {
-    // Insert
-    data.user_id = state.user.id;
-    data.progress = 0;
-    data.sort_order = state.projects.length + 1;
-    const { data: newP, error } = await sb.from('nv_projects').insert(data).select().single();
-    if(error) { toast('追加エラー','error'); return; }
-    state.projects.push(newP);
-    state.milestones[newP.id] = [];
-    state.blockers[newP.id] = [];
-    state.wins[newP.id] = [];
-  }
-  document.getElementById('modal-overlay').remove();
-  toast(id?'更新しました':'追加しました'); render();
-};
-
-// ─── Modal: Milestone ───
-window.openMilestoneModal = function(pid) {
-  const modal = document.createElement('div');
-  modal.id = 'modal-overlay';
-  modal.className = 'fixed inset-0 z-40 modal-overlay flex items-center justify-center p-4';
-  modal.onclick = (e) => { if(e.target===modal) modal.remove(); };
-  modal.innerHTML = `
-  <div class="bg-white rounded-2xl shadow-xl w-full max-w-sm fade-in" onclick="event.stopPropagation()">
-    <div class="flex items-center justify-between px-6 py-4 border-b border-gray-100">
-      <h2 class="text-base font-bold text-gray-800">マイルストーン追加</h2>
-      <button onclick="document.getElementById('modal-overlay').remove()" class="text-gray-300 hover:text-gray-500">${icons.x}</button>
-    </div>
-    <div class="px-6 py-5 space-y-3">
-      <input id="m-ms-label" placeholder="マイルストーン名" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
-    </div>
-    <div class="px-6 py-4 border-t border-gray-100 flex justify-end gap-2">
-      <button onclick="document.getElementById('modal-overlay').remove()" class="px-4 py-2 rounded-xl text-sm font-medium text-gray-500 hover:bg-gray-50">キャンセル</button>
-      <button onclick="saveMilestone('${pid}')" class="px-5 py-2 rounded-xl text-sm font-semibold text-white btn-primary">追加</button>
-    </div>
-  </div>`;
-  document.body.appendChild(modal);
-  setTimeout(()=>document.getElementById('m-ms-label').focus(),100);
-};
-
-window.saveMilestone = async function(pid) {
-  const label = document.getElementById('m-ms-label').value.trim();
-  if(!label) { toast('名前を入力してください','error'); return; }
-  const ms = state.milestones[pid]||[];
-  const { data, error } = await sb.from('nv_milestones').insert({
-    project_id: pid, user_id: state.user.id, label, done: false, sort_order: ms.length+1
-  }).select().single();
-  if(error) { toast('追加エラー','error'); return; }
-  (state.milestones[pid]??=[]).push(data);
-  await recalcProgress(pid);
-  document.getElementById('modal-overlay').remove();
-  toast('追加しました'); render();
-};
-
-// ─── Modal: Blocker ───
-window.openBlockerModal = function(pid) {
-  const modal = document.createElement('div');
-  modal.id = 'modal-overlay';
-  modal.className = 'fixed inset-0 z-40 modal-overlay flex items-center justify-center p-4';
-  modal.onclick = (e) => { if(e.target===modal) modal.remove(); };
-  modal.innerHTML = `
-  <div class="bg-white rounded-2xl shadow-xl w-full max-w-sm fade-in" onclick="event.stopPropagation()">
-    <div class="flex items-center justify-between px-6 py-4 border-b border-gray-100">
-      <h2 class="text-base font-bold text-gray-800">課題追加</h2>
-      <button onclick="document.getElementById('modal-overlay').remove()" class="text-gray-300 hover:text-gray-500">${icons.x}</button>
-    </div>
-    <div class="px-6 py-5 space-y-3">
-      <input id="m-b-text" placeholder="課題の内容" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
-      <select id="m-b-type" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
-        <option value="ai">AI対応可</option>
-        <option value="human">人に聞く</option>
-        <option value="solved">解決済み</option>
-      </select>
-      <input id="m-b-detail" placeholder="詳細・Next Action (任意)" class="w-full px-3 py-2.5 rounded-xl border border-gray-200 text-sm">
-    </div>
-    <div class="px-6 py-4 border-t border-gray-100 flex justify-end gap-2">
-      <button onclick="document.getElementById('modal-overlay').remove()" class="px-4 py-2 rounded-xl text-sm font-medium text-gray-500 hover:bg-gray-50">キャンセル</button>
-      <button onclick="saveBlocker('${pid}')" class="px-5 py-2 rounded-xl text-sm font-semibold text-white btn-primary">追加</button>
-    </div>
-  </div>`;
-  document.body.appendChild(modal);
-  setTimeout(()=>document.getElementById('m-b-text').focus(),100);
-};
-
-window.saveBlocker = async function(pid) {
-  const text = document.getElementById('m-b-text').value.trim();
-  if(!text) { toast('内容を入力してください','error'); return; }
-  const bs = state.blockers[pid]||[];
-  const { data, error } = await sb.from('nv_blockers').insert({
-    project_id: pid, user_id: state.user.id, text,
-    type: document.getElementById('m-b-type').value,
-    detail: document.getElementById('m-b-detail').value.trim() || null,
-    sort_order: bs.length+1
-  }).select().single();
-  if(error) { toast('追加エラー','error'); return; }
-  (state.blockers[pid]??=[]).push(data);
-  document.getElementById('modal-overlay').remove();
-  toast('追加しました'); render();
-};
-
-// ─── Render Engine ───
-function render() {
-  const app = document.getElementById('app');
-  if(!state.user) { app.innerHTML = renderAuth(); return; }
-  if(state.loading) { app.innerHTML = renderLoading(); return; }
+            <option value="stalled" (state.mode === 'cloud' && !state.user) { app.innerHTML = renderAuth(); return; }
+  // Loading
+  if (state.loading) { app.innerHTML = renderLoading(); return; }
+  // Dashboard
   app.innerHTML = renderDashboard();
 }
 
 // ─── Init ───
 async function init() {
-  const { data: { session } } = await sb.auth.getSession();
-  if(session) {
-    state.user = session.user;
+  if (state.mode === 'local') {
+    await idb.open();
+    state.user = { id: 'local-user', email: 'ローカル' };
     await loadAllData();
+  } else if (state.mode === 'cloud' && sb) {
+    const { data: { session } } = await sb.auth.getSession();
+    if (session) {
+      state.user = session.user;
+      await loadAllData();
+    } else {
+      render();
+    }
+    sb.auth.onAuthStateChange((event, session) => {
+      state.user = session?.user || null;
+      if (!session) { state.projects=[]; render(); }
+    });
   } else {
+    // No mode selected yet
     render();
   }
-  // Listen for auth changes
-  sb.auth.onAuthStateChange((event, session) => {
-    state.user = session?.user || null;
-    if(!session) { state.projects=[]; render(); }
-  });
 }
 init();
 </script>
